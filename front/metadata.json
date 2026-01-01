@@ -1,0 +1,8 @@
+{
+  "name": "LumiStyle - AI Personal Stylist",
+  "description": "An intelligent fashion assistant that recommends the perfect outfit from your wardrobe based on local weather and the occasion.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ]
+}
