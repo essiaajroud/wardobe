@@ -7,7 +7,7 @@ Setup:
     pip install webcolors scikit-learn xgboost requests numpy pandas
 
 Run:
-    uvicorn outfit_backend_fastapi:app --reload --host 0.0.0.0 --port 8000
+    uvicorn main:app --reload --host 0.0.0.0 --port 8000
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -49,7 +49,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Pour le développement
+    allow_origins=["http://localhost:3000"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -131,7 +131,7 @@ class WeatherService:
     """Fetch real-time weather data"""
 
     def __init__(self, api_key=None):
-        self.api_key = api_key or os.getenv('OPENWEATHER_API_KEY', '140780ba37e77f0db03188e8b323d7b1')
+        self.api_key = api_key or os.getenv('OPENWEATHER_API_KEY', 'eb09ef60723f9c25c2e6cd6da716e19e')
         self.base_url = "http://api.openweathermap.org/data/2.5/weather"
         self.geolocation_url = "http://ip-api.com/json"
 
@@ -157,7 +157,7 @@ class WeatherService:
         if city is None or country_code is None:
             city, country_code = self._get_location_from_ip()
 
-        if self.api_key == '140780ba37e77f0db03188e8b323d7b1':
+        if self.api_key == 'eb09ef60723f9c25c2e6cd6da716e19e':
             print("⚠️ Using fallback weather. Get free API key at: https://openweathermap.org/api")
             return self._get_fallback_weather()
 
@@ -282,7 +282,15 @@ class OutfitFeedbackStore:
 
     def get_statistics(self):
         if self.total_recommendations == 0:
-            return {'total': 0, 'positive_rate': 0, 'negative_rate': 0, 'neutral_rate': 0}
+            return {
+            'total': 0,
+            'positive': 0,
+            'negative': 0,
+            'neutral': 0,
+            'positive_rate': 0.0,
+            'negative_rate': 0.0,
+            'neutral_rate': 0.0
+        }
 
         neutral = self.total_recommendations - self.positive_feedback - self.negative_feedback
 
