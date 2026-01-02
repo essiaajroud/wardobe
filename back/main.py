@@ -7,7 +7,7 @@ Setup:
     pip install webcolors scikit-learn xgboost requests numpy pandas
 
 Run:
-    uvicorn outfit_backend_fastapi:app --reload --host 0.0.0.0 --port 8000
+    uvicorn main:app --reload --host 0.0.0.0 --port 8000
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -22,7 +22,7 @@ from datetime import datetime
 import pickle
 import requests
 import random
-
+from fastapi.responses import JSONResponse
 import numpy as np
 import pandas as pd
 import cv2
@@ -34,8 +34,9 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.cluster import KMeans
-from xgboost import XGBClassifier
+from xgboost import XGBRegressor
 import itertools
+from sklearn.metrics import mean_squared_error
 
 # ============================================
 # FASTAPI APP INITIALIZATION
@@ -49,7 +50,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Pour le développement
+    allow_origins=["http://localhost:3000"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -60,7 +61,8 @@ app.add_middleware(
 # ============================================
 
 UPLOAD_DIR = "./uploads/wardrobe"
-MODEL_PATH = "./models/fashion_cnn_model.keras"
+MODEL_GENERAL_PATH = "./models/fashion_main_categories.keras"
+MODEL_DRESS_PATH = "./models/fashion_dress_styles.keras"
 FEEDBACK_PATH = "./data/outfit_feedback.pkl"
 XGB_MODEL_PATH = "./data/xgb_model.pkl"
 ENCODER_PATH = "./data/encoder.pkl"
@@ -71,9 +73,10 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs("./models", exist_ok=True)
 os.makedirs("./data", exist_ok=True)
 
-# Constants from notebook
-CLASS_NAMES = ["Coat", "Dress", "Jeans", "Skirt", "Top"]
 OCCASIONS = ["casual", "work", "party", "wedding"]
+
+CLASSES_GENERAL = ["Coat", "Dress", "Jeans", "Skirt", "Top"]
+CLASSES_DRESS = ["Dress_Casual", "Dress_Wedding"]
 
 COLOR_GROUPS = {
     "Black": "neutral", "White": "neutral", "Gray": "neutral", "Beige": "neutral",
@@ -102,6 +105,42 @@ VALID_STRUCTURES = [
     ["Dress", "Coat"]
 ]
 
+def get_closest_color(requested_colour):
+    min_colours = {}
+    
+    # On prépare un dictionnaire de couleurs (Nom -> RGB)
+    color_map = {}
+    
+    try:
+        # Méthode pour webcolors 2.0+ (Utilise le registre CSS3)
+        for name in webcolors.names(spec="css3"):
+            color_map[name] = webcolors.name_to_rgb(name)
+    except (AttributeError, ValueError):
+        try:
+            # Fallback pour les anciennes versions (CSS3_NAMES_TO_HEX)
+            for name, hex_code in webcolors.CSS3_NAMES_TO_HEX.items():
+                color_map[name] = webcolors.hex_to_rgb(hex_code)
+        except AttributeError:
+            # Dernier recours : Couleurs de base si la bibliothèque est mal installée
+            color_map = {
+                "black": (0, 0, 0), "white": (255, 255, 255), "red": (255, 0, 0),
+                "green": (0, 255, 0), "blue": (0, 0, 255), "yellow": (255, 255, 0),
+                "gray": (128, 128, 128), "orange": (255, 165, 0), "pink": (255, 192, 203),
+                "purple": (128, 0, 128), "brown": (165, 42, 42)
+            }
+
+    # Calcul de la distance pour chaque couleur du dictionnaire
+    for name, rgb_values in color_map.items():
+        r_c, g_c, b_c = rgb_values
+        rd = (r_c - requested_colour[0]) ** 2
+        gd = (g_c - requested_colour[1]) ** 2
+        bd = (b_c - requested_colour[2]) ** 2
+        min_colours[(rd + gd + bd)] = name
+        
+    return min_colours[min(min_colours.keys())]
+
+
+
 # ============================================
 # GLOBAL STATE
 # ============================================
@@ -109,7 +148,8 @@ VALID_STRUCTURES = [
 class AppState:
     def __init__(self):
         self.wardrobe = []
-        self.cnn_model = None
+        self.cnn_general = None
+        self.cnn_styles = None
         self.base_model = None
         self.xgb_model = None
         self.encoder = None
@@ -131,94 +171,57 @@ class WeatherService:
     """Fetch real-time weather data"""
 
     def __init__(self, api_key=None):
-        self.api_key = api_key or os.getenv('OPENWEATHER_API_KEY', '140780ba37e77f0db03188e8b323d7b1')
-        self.base_url = "http://api.openweathermap.org/data/2.5/weather"
-        self.geolocation_url = "http://ip-api.com/json"
+        self.api_key = api_key or "140780ba37e77f0db03188e8b323d7b1"
+        # OpenWeatherMap API endpoint
+        self.base_url = "https://api.openweathermap.org/data/2.5/weather"
 
     def _get_location_from_ip(self):
-        """Detects city and country code based on IP address."""
         try:
-            response = requests.get(self.geolocation_url, timeout=5)
-            response.raise_for_status()
+            response = requests.get("https://ipapi.co/json/", timeout=5)
             data = response.json()
-            if data and data['status'] == 'success':
-                city = data.get('city')
-                country_code = data.get('countryCode')
-                print(f"🌍 Detected location: {city}, {country_code} (from IP)")
-                return city, country_code
-            else:
-                print(f"❌ Geolocation API error: {data.get('message', 'Unknown error')}. Using default.")
-        except Exception as e:
-            print(f"❌ Geolocation error: {e}. Using default.")
-        return "Sfax", "TN"
+            return data.get('city', 'Sousse'), data.get('country_code', 'TN')
+        except:
+            return "Sousse", "TN"
 
     def get_weather(self, city=None, country_code=None):
-        """Get current weather for a location. Detects location if not provided."""
-        if city is None or country_code is None:
+        if not city: 
             city, country_code = self._get_location_from_ip()
-
-        if self.api_key == '140780ba37e77f0db03188e8b323d7b1':
-            print("⚠️ Using fallback weather. Get free API key at: https://openweathermap.org/api")
-            return self._get_fallback_weather()
-
+        
         try:
-            params = {
-                'q': f"{city},{country_code}",
-                'appid': self.api_key,
-                'units': 'metric'
-            }
-
-            response = requests.get(self.base_url, params=params, timeout=5)
-            response.raise_for_status()
+            url = f"{self.base_url}?q={city},{country_code}&appid={self.api_key}&units=metric"
+            response = requests.get(url, timeout=5)
             data = response.json()
+            
+            if response.status_code == 200:
+                return {
+                    'temperature': round(data['main']['temp'], 1),
+                    'feels_like': round(data['main']['feels_like'], 1),
+                    'weather': data['weather'][0]['main'],
+                    'description': data['weather'][0]['description'],
+                    'humidity': data['main']['humidity'],
+                    'wind_speed': data['wind']['speed'],
+                    'city': city,
+                    'timestamp': datetime.now().isoformat()
+                }
+            else:
+                return self._get_fallback_weather(city)
+        except:
+            return self._get_fallback_weather(city)
 
-            weather_info = {
-                'temperature': round(data['main']['temp'], 1),
-                'feels_like': round(data['main']['feels_like'], 1),
-                'weather': data['weather'][0]['main'],
-                'description': data['weather'][0]['description'],
-                'humidity': data['main']['humidity'],
-                'wind_speed': data['wind']['speed'],
-                'city': city,
-                'timestamp': datetime.now().isoformat()
-            }
-
-            print(f"🌤️ Real weather in {city}: {weather_info['temperature']}°C - {weather_info['description']}")
-            return weather_info
-
-        except Exception as e:
-            print(f"❌ Weather API error: {e}. Using fallback.")
-            return self._get_fallback_weather()
-
-    def _get_fallback_weather(self):
-        """Season-based fallback weather"""
-        month = datetime.now().month
-
-        if month in [12, 1, 2]:  # Winter
-            temp = random.randint(5, 15)
-            weather = "Cold"
-        elif month in [3, 4, 5]:  # Spring
-            temp = random.randint(15, 23)
-            weather = "Mild"
-        elif month in [6, 7, 8]:  # Summer
-            temp = random.randint(25, 35)
-            weather = "Hot"
-        else:  # Autumn
-            temp = random.randint(15, 22)
-            weather = "Cool"
-
-        print(f"🌡️ Fallback weather: {temp}°C - {weather}")
-
+    def _get_fallback_weather(self, city="Sousse"):
+        temp = random.randint(12, 18) # Température réaliste pour Janvier en Tunisie
         return {
-            'temperature': temp,
-            'feels_like': temp,
-            'weather': weather,
-            'description': f'{weather.lower()} weather',
-            'humidity': 60,
-            'wind_speed': 3.5,
-            'city': 'Sfax',
+            'temperature': float(temp),
+            'feels_like': float(temp),
+            'weather': 'Clouds',
+            'description': 'overcast clouds',
+            'humidity': 70,
+            'wind_speed': 5.0,
+            'city': city,
             'timestamp': datetime.now().isoformat()
         }
+
+    
 
 # ============================================
 # FEEDBACK STORE (from notebook)
@@ -282,7 +285,15 @@ class OutfitFeedbackStore:
 
     def get_statistics(self):
         if self.total_recommendations == 0:
-            return {'total': 0, 'positive_rate': 0, 'negative_rate': 0, 'neutral_rate': 0}
+            return {
+            'total': 0,
+            'positive': 0,
+            'negative': 0,
+            'neutral': 0,
+            'positive_rate': 0.0,
+            'negative_rate': 0.0,
+            'neutral_rate': 0.0
+        }
 
         neutral = self.total_recommendations - self.positive_feedback - self.negative_feedback
 
@@ -345,18 +356,39 @@ class RLRecommender:
         self.exploration_rate = 0.15
 
     def recommend_with_rl(self, wardrobe, encoder, scaler, num_features, cat_features,
-                          temperature, occasion, top_k=3):
-        """Get top K recommendations with RL boost"""
+                      temperature, occasion, top_k=3):
+        """
+        Génère les meilleures recommandations avec :
+        - Filtres logiques stricts (No Jeans in Weddings, etc.)
+        - Ajustement basé sur le feedback (RL)
+        - Diversité (Shuffle) pour éviter la répétition
+        """
 
         all_outfits = generate_outfits(wardrobe)
         scored_outfits = []
 
         for outfit in all_outfits:
+            # --- FILTRES DE SÉCURITÉ LOGIQUE (Hard Constraints) ---
+            types = [item["type"] for item in outfit]
+            
+            # 1. Règles pour le Mariage (Wedding)
+            if occasion == "wedding":
+                # On élimine immédiatement les jeans et les robes casual du mariage
+                if "Jeans" in types or "Dress_Casual" in types:
+                    continue 
+            
+            # 2. Règles pour le Quotidien/Travail
+            else:
+                # On élimine la robe de mariée si ce n'est pas un mariage
+                if "Dress_Wedding" in types:
+                    continue
+
+            # --- EXTRACTION DES FEATURES ---
             outfit_feats = outfit_to_vector(outfit, state.base_model)
             if outfit_feats is None:
                 continue
 
-            # Base XGBoost score
+            # --- PRÉDICTION XGBOOST (Base Score) ---
             numerical_values = [
                 temperature,
                 outfit_feats["color_score"],
@@ -366,16 +398,30 @@ class RLRecommender:
                 outfit_feats["has_coat"]
             ]
 
+            # Transformation des données pour le modèle
             numerical_df = pd.DataFrame([numerical_values], columns=num_features)
             scaled_num = scaler.transform(numerical_df)
             encoded_cat = encoder.transform(pd.DataFrame([{"occasion": occasion}])[cat_features])
             X_predict = np.hstack([scaled_num, encoded_cat])
 
-            base_score = self.base_model.predict_proba(X_predict)[0][1]
+            # Calcul du score via le Régresseur
+            base_score = float(self.base_model.predict(X_predict)[0])
+            base_score = max(0.0, min(1.0, base_score)) 
 
-            # RL adjustment
+            # --- AJUSTEMENTS ET PRIORITÉS ---
+            
+            # 1. Bonus de priorité pour les robes de mariage lors d'un mariage
+            if occasion == "wedding" and "Dress_Wedding" in types:
+                base_score += 0.5 
+                
+            # 2. Ajustement RL (Feedback utilisateur)
+            # _get_rl_adjustment doit renvoyer une valeur négative si Dislike (-0.8) 
+            # ou positive si Like (+0.2)
             rl_adjustment = self._get_rl_adjustment(outfit, temperature, occasion)
-            final_score = min(base_score * (1 + rl_adjustment), 1.0)
+            
+            # Calcul du score final (Score de base * Multiplicateur de feedback)
+            # On limite le score final pour garder une cohérence
+            final_score = min(base_score * (1 + rl_adjustment), 1.5)
 
             scored_outfits.append({
                 'outfit': outfit,
@@ -384,33 +430,44 @@ class RLRecommender:
                 'final_score': final_score
             })
 
-        # Sort by final score
+        # Si aucune tenue ne correspond aux filtres
+        if not scored_outfits:
+            return []
+
+        # --- TRI ET DIVERSITÉ (Shuffle) ---
+        
+        # 1. On trie d'abord par score pour identifier les meilleurs candidats
         scored_outfits.sort(key=lambda x: x['final_score'], reverse=True)
 
-        # Exploration
-        if random.random() < self.exploration_rate and len(scored_outfits) > top_k:
-            print("🔍 Exploring new combination...")
-            explored = random.choice(scored_outfits[top_k:min(top_k+10, len(scored_outfits))])
-            scored_outfits = scored_outfits[:top_k-1] + [explored]
+        # 2. Pour éviter de voir toujours les 3 mêmes choix :
+        # On prend les 10 meilleurs candidats (Top 10)
+        top_pool = scored_outfits[:min(10, len(scored_outfits))]
+        
+        # 3. On mélange ce Top 10 aléatoirement
+        random.shuffle(top_pool)
 
-        return scored_outfits[:top_k]
+        # 4. On trie à nouveau légèrement le pool mélangé pour s'assurer 
+        # que les tenues détestées (RL négatif) restent quand même en bas.
+        top_pool.sort(key=lambda x: x['final_score'], reverse=True)
+
+        # Retourne les Top K résultats
+        return top_pool[:top_k]
 
     def _get_rl_adjustment(self, outfit, temperature, occasion):
-        """Calculate RL boost based on feedback history"""
         outfit_types = tuple(sorted([item['type'] for item in outfit]))
         temp_range = self.feedback_store._get_temp_range(temperature)
-
-        preferences = self.feedback_store.get_preferred_combinations(min_score=0, min_count=1)
+        preferences = self.feedback_store.get_preferred_combinations(min_score=-1, min_count=1)
         key = (occasion, temp_range, outfit_types)
 
         if key in preferences:
             pref = preferences[key]
-            avg_score = pref['avg_score']
+            avg_score = pref['avg_score'] # Si Dislike, c'est -1
             count = pref['count']
-            confidence = min(count / 10, 1.0)
-            adjustment = avg_score * 0.15 * confidence
+            confidence = min(count / 3, 1.0) # Confiance plus rapide (3 votes suffisent)
+            
+            # ✅ AUGMENTATION DE L'IMPACT : de 0.15 à 0.8
+            adjustment = avg_score * 0.8 * confidence 
             return adjustment
-
         return 0.0
 
 # ============================================
@@ -434,30 +491,43 @@ def compute_thermal_scores(cnn_feat):
     breath = np.clip(breath, 0, 1)
     return warmth, breath
 
-def predict_clothing(img_path, cnn_model):
-    """Predict clothing type"""
+def predict_clothing_cascading(img_path):
+    # 1. Prédiction Générale
     img = image.load_img(img_path, target_size=(224, 224))
-    arr = image.img_to_array(img)
-    arr = preprocess_input(arr)
+    arr = preprocess_input(image.img_to_array(img))
     arr = np.expand_dims(arr, axis=0)
-    preds = cnn_model.predict(arr, verbose=0)
-    idx = np.argmax(preds)
-    conf = np.max(preds)
-    return CLASS_NAMES[idx], conf
+    
+    preds_gen = state.cnn_general.predict(arr, verbose=0)
+    label = CLASSES_GENERAL[np.argmax(preds_gen)]
+    confidence = np.max(preds_gen)
+
+    # 2. Logique de Cascade : Si c'est une robe, on demande à l'expert
+    if label == "Dress":
+        preds_style = state.cnn_styles.predict(arr, verbose=0)
+        label = CLASSES_DRESS[np.argmax(preds_style)]
+        confidence = np.max(preds_style) 
+
+    return label, confidence
 
 def detect_color(img_path):
     """Detect dominant color"""
     img = cv2.imread(img_path)
+    if img is None: return "Unknown"
+    
     img = cv2.resize(img, (100, 100))
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     pixels = img_rgb.reshape(-1, 3)
+    
     kmeans = KMeans(n_clusters=1, n_init=10, random_state=42)
     kmeans.fit(pixels)
     color = kmeans.cluster_centers_[0].astype(int)
+    
     try:
+        # Essaye la correspondance exacte d'abord
         return webcolors.rgb_to_name(tuple(color)).capitalize()
-    except:
-        return "Unknown"
+    except ValueError:
+        # ✅ FIX : Si pas de correspondance exacte, cherche la plus proche
+        return get_closest_color(color).capitalize()
 
 def color_score(outfit):
     """Calculate color compatibility score"""
@@ -482,17 +552,47 @@ def generate_outfits(wardrobe):
     return outfits
 
 def smart_label(outfit, temperature, occasion):
-    """Generate smart label for outfit"""
+    """L'intelligence de l'IA : définit ce qui est bien ou mal"""
     types = [i["type"] for i in outfit]
-    if "Dress" in types and ("Jeans" in types or "Top" in types):
-        return 0
-    if temperature < 10 and "Coat" not in types:
-        return 0
-    if temperature > 25 and "Coat" in types:
-        return 0
-    if occasion == "wedding" and "Dress" not in types:
-        return 0
-    return 1
+    
+    # --- RÈGLES POUR LE MARIAGE (Wedding) ---
+    if occasion == "wedding":
+        # Interdiction absolue du Jeans au mariage
+        if "Jeans" in types: 
+            return 0.0 
+        
+        # Priorité maximale à la robe de mariage
+        if "Dress_Wedding" in types: 
+            return 1.0
+            
+        # Les jupes élégantes sont acceptables mais moins bien qu'une robe
+        if "Skirt" in types:
+            return 0.6
+            
+        # Les robes casual sont mal vues au mariage
+        if "Dress_Casual" in types:
+            return 0.1
+            
+        return 0.2 # Autres combinaisons bof
+
+    # --- RÈGLES POUR LE CASUAL ---
+    if occasion == "casual":
+        if "Dress_Wedding" in types: return 0.0 # Trop habillé pour un café
+        if "Jeans" in types: return 1.0 # Le jeans est parfait en casual
+        return 0.8
+
+    # --- RÈGLES POUR LE TRAVAIL (Work) ---
+    if occasion == "work":
+        if "Dress_Wedding" in types: return 0.0
+        if "Jeans" in types: return 0.7 # Acceptable selon le milieu
+        if "Skirt" in types or "Dress_Casual" in types: return 1.0
+        return 0.8
+
+    # --- RÈGLES THERMIQUES (Sécurité) ---
+    if temperature < 12 and "Coat" not in types:
+        return 0.0 # Interdiction d'avoir froid !
+        
+    return 0.5
 
 def outfit_to_vector(outfit, base_model):
     """Convert outfit to feature vector"""
@@ -583,11 +683,12 @@ def train_xgb(df):
     Xf = np.hstack([X_num, X_cat])
     Xtr, Xte, ytr, yte = train_test_split(Xf, y, test_size=0.2, random_state=42)
 
-    model = XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.05, random_state=42)
+    model = XGBRegressor(n_estimators=300, max_depth=6, learning_rate=0.05, random_state=42)
     model.fit(Xtr, ytr)
 
-    accuracy = accuracy_score(yte, model.predict(Xte))
-    print(f"✅ XGBoost Model Accuracy: {accuracy:.3f}")
+    preds = model.predict(Xte)
+    mse = mean_squared_error(yte, preds)
+    print(f"✅ XGBoost Model MSE: {mse:.4f}") # Plus le chiffre est proche de 0, mieux c'est
 
     return model, enc, scaler, num_features_model, cat_features_model
 
@@ -604,13 +705,14 @@ class WardrobeItem(BaseModel):
 
 class WeatherResponse(BaseModel):
     temperature: float
-    feels_like: float
-    weather: str
-    description: str
-    humidity: int
-    wind_speed: float
     city: str
+    description: str
     timestamp: str
+    # On rend ces champs optionnels pour éviter les erreurs 500
+    feels_like: Optional[float] = None
+    weather: Optional[str] = None
+    humidity: Optional[int] = None
+    wind_speed: Optional[float] = None
 
 class RecommendationRequest(BaseModel):
     temperature: Optional[float] = None
@@ -648,52 +750,19 @@ class StatisticsResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize services on startup"""
-    print("\n" + "="*60)
-    print("🚀 AI OUTFIT RECOMMENDER API - STARTING")
-    print("="*60 + "\n")
-    
-    # Initialize weather service
+    print("🚀 Initialisation de Outfit of the Day...")
     state.weather_service = WeatherService()
-    print("✅ Weather service initialized")
-    
-    # Initialize feedback store
     state.feedback_store = OutfitFeedbackStore(FEEDBACK_PATH)
-    print(f"✅ Feedback store initialized ({len(state.feedback_store.feedback_history)} entries)")
     
-    # Load CNN model if exists
-    if os.path.exists(MODEL_PATH):
-        try:
-            state.cnn_model = tf.keras.models.load_model(MODEL_PATH)
-            print("✅ CNN model loaded")
-        except Exception as e:
-            print(f"⚠️ Could not load CNN model: {e}")
-            print("   Model will be trained when wardrobe is uploaded")
-    
-    # Load MobileNetV2 base model
-    state.base_model = tf.keras.applications.MobileNetV2(
-        include_top=False,
-        weights="imagenet",
-        input_shape=(224, 224, 3),
-        pooling="avg"
-    )
-    print("✅ MobileNetV2 base model loaded")
-    
-    # Load saved models if they exist
-    if os.path.exists(XGB_MODEL_PATH):
-        try:
-            with open(XGB_MODEL_PATH, 'rb') as f:
-                state.xgb_model = pickle.load(f)
-            with open(ENCODER_PATH, 'rb') as f:
-                state.encoder = pickle.load(f)
-            with open(SCALER_PATH, 'rb') as f:
-                state.scaler = pickle.load(f)
-            print("✅ XGBoost model, encoder, and scaler loaded")
-        except Exception as e:
-            print(f"⚠️ Could not load saved models: {e}")
+    try:
+        state.cnn_general = tf.keras.models.load_model(MODEL_GENERAL_PATH)
+        state.cnn_styles = tf.keras.models.load_model(MODEL_DRESS_PATH)
+        state.base_model = tf.keras.applications.MobileNetV2(include_top=False, weights="imagenet", pooling="avg")
+        print("✅ Modèles chargés avec succès")
+    except Exception as e:
+        print(f"❌ Erreur chargement modèles: {e}")
     
     state.is_initialized = True
-    print("\n✅ API READY!\n")
 
 # ============================================
 # API ENDPOINTS
@@ -724,84 +793,36 @@ async def health_check():
         "status": "healthy",
         "initialized": state.is_initialized,
         "wardrobe_items": len(state.wardrobe),
-        "cnn_model_loaded": state.cnn_model is not None,
+        "cnn_models_loaded": (state.cnn_general is not None or state.cnn_styles is not None),
         "xgb_model_loaded": state.xgb_model is not None,
         "feedback_entries": len(state.feedback_store.feedback_history) if state.feedback_store else 0,
         "timestamp": datetime.now().isoformat()
     }
 
 @app.post("/api/wardrobe/upload")
-async def upload_wardrobe(files: List[UploadFile] = File(...)):
-    """Upload wardrobe images"""
-    
-    if not state.cnn_model:
-        raise HTTPException(
-            status_code=400, 
-            detail="CNN model not loaded. Please ensure fashion_cnn_model.keras is in ./models/"
-        )
-    
-    uploaded_items = []
-    
+async def upload(files: List[UploadFile] = File(...)):
+    uploaded = []
     for file in files:
-        # Generate unique ID
         item_id = str(uuid.uuid4())
-        file_ext = os.path.splitext(file.filename)[1].lower()
+        path = os.path.join(UPLOAD_DIR, f"{item_id}.jpg")
+        with open(path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
         
-        if file_ext not in ['.jpg', '.jpeg', '.png']:
-            continue
-            
-        file_path = os.path.join(UPLOAD_DIR, f"{item_id}{file_ext}")
+        label, conf = predict_clothing_cascading(path)
         
-        # Save file
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        try:
-            # Predict clothing type and detect color
-            clothing_type, confidence = predict_clothing(file_path, state.cnn_model)
-            color = detect_color(file_path)
-            
-            if confidence > 0.6:  # Only add if confidence is high enough
-                item = {
-                    "item_id": item_id,
-                    "type": clothing_type,
-                    "color": color,
-                    "image": file_path,
-                    "confidence": float(confidence),
-                    "filename": file.filename
-                }
-                
-                uploaded_items.append(item)
-                state.wardrobe.append(item)
-            else:
-                os.remove(file_path)  # Remove low confidence predictions
-                
-        except Exception as e:
-            print(f"Error processing {file.filename}: {e}")
-            if os.path.exists(file_path):
-                os.remove(file_path)
-    
-    # Train model if we have enough items
-    if len(state.wardrobe) >= 5 and not state.xgb_model:
-        await train_model()
-    
-    return {
-        "message": f"Successfully uploaded {len(uploaded_items)} items",
-        "wardrobe": uploaded_items,
-        "total_items": len(state.wardrobe)
-    }
+        # Détection couleur
+        img = cv2.imread(path)
+        avg_color = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).mean(axis=(0, 1)).astype(int)
+        color_name = get_closest_color(avg_color).capitalize()
+
+        if conf > 0.5:
+            item = {"item_id": item_id, "type": label, "color": color_name, "image": path, "confidence": float(conf)}
+            state.wardrobe.append(item)
+            uploaded.append(item)
+    return {"wardrobe": uploaded}
 
 @app.get("/api/wardrobe")
 async def get_wardrobe():
-    """Get current wardrobe"""
-    return {
-        "wardrobe": state.wardrobe,
-        "total_items": len(state.wardrobe),
-        "by_type": {
-            clothing_type: len([w for w in state.wardrobe if w["type"] == clothing_type])
-            for clothing_type in CLASS_NAMES
-        }
-    }
+    return {"wardrobe": state.wardrobe}
 
 @app.delete("/api/wardrobe/clear")
 async def clear_wardrobe():
@@ -818,17 +839,9 @@ async def clear_wardrobe():
     return {"message": "Wardrobe cleared successfully"}
 
 @app.get("/api/wardrobe/image/{item_id}")
-async def get_wardrobe_image(item_id: str):
-    """Get wardrobe item image"""
-    item = next((w for w in state.wardrobe if w["item_id"] == item_id), None)
-    
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-    
-    if not os.path.exists(item["image"]):
-        raise HTTPException(status_code=404, detail="Image file not found")
-    
-    return FileResponse(item["image"])
+async def get_img(item_id: str):
+    path = os.path.join(UPLOAD_DIR, f"{item_id}.jpg")
+    return FileResponse(path)
 
 @app.post("/api/wardrobe/train")
 async def train_model():
@@ -888,6 +901,7 @@ async def get_weather(city: Optional[str] = None, country: Optional[str] = None)
     
     weather_data = state.weather_service.get_weather(city, country)
     return weather_data
+
 
 @app.post("/api/recommendations")
 async def get_recommendations(request: RecommendationRequest):
@@ -1045,22 +1059,27 @@ async def get_preferences():
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
-    return {
-        "error": exc.detail,
-        "status_code": exc.status_code,
-        "timestamp": datetime.now().isoformat()
-    }
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status_code": exc.status_code,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
     print(f"❌ Unhandled error: {exc}")
-    return {
-        "error": "Internal server error",
-        "detail": str(exc),
-        "status_code": 500,
-        "timestamp": datetime.now().isoformat()
-    }
-
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "detail": str(exc),
+            "status_code": 500,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
 # ============================================
 # MAIN
 # ============================================
@@ -1068,26 +1087,8 @@ async def general_exception_handler(request, exc):
 if __name__ == "__main__":
     import uvicorn
     
-    print("""
-    ╔══════════════════════════════════════════╗
-    ║   AI Outfit Recommender API Server       ║
-    ║   Version 2.0.0 - Adjusted to Notebook   ║
-    ╚══════════════════════════════════════════╝
-    
-    🚀 Starting server...
-    📡 API Documentation: http://localhost:8000/docs
-    🌐 Health Check: http://localhost:8000/health
-    
-    📝 Required setup:
-    1. Place fashion_cnn_model.keras in ./models/
-    2. Upload wardrobe images via /api/wardrobe/upload
-    3. Train model via /api/wardrobe/train
-    4. Get recommendations via /api/recommendations
-    
-    """)
-    
     uvicorn.run(
-        "outfit_backend_fastapi:app",
+        "main:app",
         host="0.0.0.0",
         port=8000,
         reload=True,
