@@ -11,8 +11,7 @@ export enum Occasion {
   WORK = 'work',
   PARTY = 'party',
   WEDDING = 'wedding',
-  DATE = 'date',
-  SPORT = 'sport'
+
 }
 
 export interface ClothingItem {

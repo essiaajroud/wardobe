@@ -71,22 +71,22 @@ const App: React.FC = () => {
     [Occasion.WORK]: 'fa-briefcase',
     [Occasion.PARTY]: 'fa-glass-cheers',
     [Occasion.WEDDING]: 'fa-ring',
-    [Occasion.DATE]: 'fa-heart',
-    [Occasion.SPORT]: 'fa-running'
+    
   };
 
   // --- API Handlers ---
 
   const fetchWeather = async () => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/weather?city=Sfax&country=TN`);
-      if (!res.ok) throw new Error("Weather fetch failed");
-      const data = await res.json();
-      setWeatherData(data);
-    } catch (e) {
-      console.error("Weather error:", e);
-    }
-  };
+  try {
+    // On ne passe plus de ville en dur, le backend utilisera l'IP
+    const res = await fetch(`${API_BASE_URL}/api/weather`); 
+    if (!res.ok) throw new Error("Weather fetch failed");
+    const data = await res.json();
+    setWeatherData(data);
+  } catch (e) {
+    console.error("Weather error:", e);
+  }
+};
 
   const fetchStats = async () => {
     try {
@@ -105,7 +105,7 @@ const App: React.FC = () => {
       const data = await res.json();
       const mapped = data.wardrobe.map((item: any) => ({
         id: item.item_id,
-        name: `${item.color} ${item.type}`,
+        name: `${item.type}`,
         category: item.type,
         color: item.color,
         imageData: `${API_BASE_URL}/api/wardrobe/image/${item.item_id}`,
@@ -119,38 +119,61 @@ const App: React.FC = () => {
     }
   };
 
-  useEffect(() => {
+   useEffect(() => {
     fetchWeather();
+    const interval = setInterval(fetchWeather, 600000); 
+    return () => clearInterval(interval);
+
+  }, []);
+
+  useEffect(() => {
+    // fetchWeather();
+    // const interval = setInterval(fetchWeather, 600000); 
+    // return () => clearInterval(interval);
     fetchStats();
     loadWardrobe();
   }, []);
 
-  const uploadToBackend = async (blob: Blob) => {
-    setAnalyzing(true);
-    const formData = new FormData();
-    formData.append('files', blob, `upload_${Date.now()}.jpg`);
 
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/wardrobe/upload`, {
-        method: 'POST',
-        body: formData,
-      });
-      if (!res.ok) throw new Error("Upload failed");
-      
-      const data = await res.json();
-      alert(`Vêtement identifié : ${data.wardrobe[0].color} ${data.wardrobe[0].type}`);
-      loadWardrobe(); // Recharger la liste depuis le serveur
-    } catch (err) {
-      console.error("Upload Error:", err);
-      alert("Erreur lors de la connexion au serveur Python (8000).");
-    } finally {
-      setAnalyzing(false);
+const uploadToBackend = async (blob: Blob) => {
+  setAnalyzing(true);
+  const formData = new FormData();
+  formData.append('files', blob, `upload_${Date.now()}.jpg`);
+
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/wardrobe/upload`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) throw new Error("Upload failed");
+    
+    const data = await res.json();
+
+    // ✅ FIX : Vérifier si la liste n'est pas vide avant d'accéder à l'index [0]
+    if (data.wardrobe && data.wardrobe.length > 0) {
+      console.log(`Vêtement identifié : ${data.wardrobe[0].type}`);
+      loadWardrobe(); // Recharger la liste
+    } else {
+      console.log("L'IA n'est pas sûre d'elle (confiance < 60%). Réessayez avec une meilleure lumière.");
     }
-  };
+
+  } catch (err) {
+    console.error("Upload Error:", err);
+    alert("Erreur lors de la connexion au serveur.");
+  } finally {
+    setAnalyzing(false);
+  }
+};
 
   const handleRecommend = async () => {
-    if (!weatherData) return alert("Météo en cours de chargement...");
-    if (wardrobe.length === 0) return alert("Votre dressing est vide !");
+    if (!weatherData) {
+      console.log("Météo en cours de chargement...");
+      return;
+    }
+    if (wardrobe.length === 0) {
+      console.log("Votre dressing est vide !");
+      return;
+    }
 
     setLoading(true);
     try {
@@ -160,7 +183,7 @@ const App: React.FC = () => {
         body: JSON.stringify({
           temperature: weatherData.temperature,
           occasion: occasion,
-          top_k: 2
+          top_k: 3
         }),
       });
       if (!res.ok) throw new Error("Recommendation failed");
@@ -168,42 +191,45 @@ const App: React.FC = () => {
       const data = await res.json();
       setRecommendations(data.recommendations);
     } catch (err) {
-      alert("Erreur du modèle de recommandation. Vérifiez si le modèle est entraîné.");
+      console.error("Recommendation Error:", err);
     } finally {
       setLoading(false);
     }
   };
 
   const handleFeedback = async (rec: any, score: number) => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/feedback`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          outfit_id: rec.outfit_id,
-          outfit: rec.outfit,
-          temperature: weatherData?.temperature || 20,
-          occasion: occasion,
-          feedback_score: score
-        }),
-      });
-      if (res.ok) {
-        fetchStats();
-        alert(score > 0 ? "Génial ! Lumi apprend de vos goûts." : "C'est noté, Lumi ajuste son modèle.");
-      }
-    } catch (e) {
-      console.error("Feedback error:", e);
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        outfit_id: rec.outfit_id,
+        outfit: rec.outfit,
+        temperature: weatherData?.temperature || 20,
+        occasion: occasion,
+        feedback_score: score
+      }),
+    });
+    if (res.ok) {
+      fetchStats();
+      console.log(score > 0 
+        ? "Génial ! Outfit of the Day apprend de vos goûts." 
+        : "C'est noté, Outfit of the Day ajuste son modèle."
+      );
     }
-  };
+  } catch (e) {
+    console.error("Feedback error:", e);
+    console.error("Erreur lors de la connexion au serveur.");}
+};
 
   const trainModel = async () => {
     setLoading(true);
     try {
       const res = await fetch(`${API_BASE_URL}/api/wardrobe/train`, { method: 'POST' });
       const data = await res.json();
-      alert("Modèle XGBoost ré-entraîné avec succès !");
+      console.log("Modèle XGBoost ré-entraîné avec succès !", data);
     } catch (e) {
-      alert("Besoin d'au moins 5 articles pour l'entraînement.");
+      console.log("Besoin d'au moins 5 articles pour l'entraînement.");
     } finally {
       setLoading(false);
     }
@@ -228,7 +254,7 @@ const App: React.FC = () => {
       if (videoRef.current) videoRef.current.srcObject = stream;
     } catch (err) {
       setIsCameraOpen(false);
-      alert("Accès caméra refusé.");
+      console.error("Accès caméra refusé.", err);
     }
   };
 
@@ -256,30 +282,32 @@ const App: React.FC = () => {
     <div className="min-h-screen bg-white selection:bg-black selection:text-white">
       {/* Header */}
       <header className="fixed top-0 left-0 right-0 z-40 bg-white/90 backdrop-blur-2xl border-b border-neutral-100">
-        <div className="max-w-7xl mx-auto px-6 h-24 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-black rounded-xl flex items-center justify-center shadow-lg">
-              <i className="fas fa-microchip text-white text-sm"></i>
-            </div>
-            <span className="text-2xl font-serif italic tracking-tighter">Lumi.</span>
-          </div>
-          <nav className="flex bg-neutral-100 p-1.5 rounded-full border border-neutral-200/50">
-            <TabButton active={activeTab === 'closet'} onClick={() => setActiveTab('closet')} label="Dressing" icon="fa-th-large" />
-            <TabButton active={activeTab === 'stylist'} onClick={() => setActiveTab('stylist')} label="Styliste" icon="fa-wand-magic-sparkles" />
-          </nav>
-          <div className="hidden md:flex items-center gap-6">
-             {stats && (
-               <div className="text-right">
-                 <div className="text-[9px] font-black text-neutral-300 uppercase tracking-widest">Précision Modèle</div>
-                 <div className="text-sm font-bold text-black">{stats.positive_rate}%</div>
-               </div>
-             )}
-             <div className="w-10 h-10 rounded-full bg-neutral-100 border border-neutral-200 overflow-hidden">
-                <img src="https://picsum.photos/100/100?random=1" alt="Avatar" />
-             </div>
-          </div>
-        </div>
-      </header>
+  <div className="max-w-7xl mx-auto px-6 h-24 flex items-center justify-between">
+    <div className="flex items-center gap-3">
+      {/* Nouveau symbole : Vêtement (fa-tshirt) */}
+      <div className="w-10 h-10 bg-black rounded-xl flex items-center justify-center shadow-lg">
+        <i className="fas fa-tshirt text-white text-sm"></i>
+      </div>
+      {/* Nouveau nom : Outfit of the Day */}
+      <span className="text-2xl font-serif italic tracking-tighter">Outfit of the Day</span>
+    </div>
+    
+    <nav className="flex bg-neutral-100 p-1.5 rounded-full border border-neutral-200/50">
+      <TabButton active={activeTab === 'closet'} onClick={() => setActiveTab('closet')} label="Dressing" icon="fa-th-large" />
+      <TabButton active={activeTab === 'stylist'} onClick={() => setActiveTab('stylist')} label="Styliste" icon="fa-wand-magic-sparkles" />
+    </nav>
+
+    <div className="hidden md:flex items-center gap-6">
+       {stats && (
+         <div className="text-right">
+           <div className="text-[9px] font-black text-neutral-300 uppercase tracking-widest">Précision Modèle</div>
+           <div className="text-sm font-bold text-black">{stats.positive_rate}%</div>
+         </div>
+       )}
+       {/* LE CERCLE AVATAR A ÉTÉ SUPPRIMÉ ICI */}
+    </div>
+  </div>
+</header>
 
       <main className="pt-36 pb-24 max-w-7xl mx-auto px-6">
         {activeTab === 'closet' && (
@@ -369,12 +397,15 @@ const App: React.FC = () => {
             <div className="lg:col-span-7">
               <div className={`min-h-[70vh] rounded-[4rem] bg-neutral-50/30 border-2 border-neutral-50 p-8 md:p-16 flex flex-col ${recommendations.length > 0 ? 'justify-start' : 'justify-center items-center text-center'}`}>
                 {recommendations.length === 0 ? (
-                  <div className="max-w-xs">
+                  <div className="max-w-xs text-center">
+                    {/* Icône de robe pour l'attente */}
                     <div className="w-24 h-24 mb-10 bg-white rounded-[2.5rem] flex items-center justify-center mx-auto shadow-2xl text-neutral-200">
-                      <i className="fas fa-magic text-4xl"></i>
+                      <i className="fas fa-vest text-4xl"></i>
                     </div>
                     <h3 className="text-2xl font-medium mb-4">En attente</h3>
-                    <p className="text-neutral-400 text-sm leading-relaxed">Choisissez une occasion. Lumi consultera son modèle de Reinforcement Learning pour trouver la meilleure tenue.</p>
+                    <p className="text-neutral-400 text-sm leading-relaxed">
+                      Choisissez une occasion. <strong>Outfit of the Day</strong> consultera son modèle de Reinforcement Learning pour trouver la meilleure tenue.
+                    </p>
                   </div>
                 ) : (
                   <div className="animate-in fade-in duration-1000 space-y-16 w-full">
@@ -391,7 +422,7 @@ const App: React.FC = () => {
                                 />
                               </div>
                               <span className="text-[10px] font-black uppercase text-neutral-300 tracking-[0.2em]">{piece.type}</span>
-                              <p className="text-md font-bold truncate">{piece.color}</p>
+                              {/* Color suppressed from UI per request */}
                             </div>
                           ))}
                         </div>
@@ -406,7 +437,7 @@ const App: React.FC = () => {
                           <div className="pt-8 border-t border-neutral-100 flex justify-between items-center">
                             <div>
                                <div className="text-[9px] font-black text-neutral-300 uppercase tracking-widest mb-1">Score de Confiance</div>
-                               <div className="text-xl font-bold">{(rec.final_score * 100).toFixed(0)}%</div>
+                               <div className="text-xl font-bold">{rec.final_score >= 0.95 ? "99" : (rec.final_score * 100).toFixed(0)}%</div>
                             </div>
                             <div className="flex gap-3">
                                <button 
